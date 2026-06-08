@@ -1,0 +1,40 @@
+**/owl.db
+
+#project folders
+/logs/*
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Environments
+.env
+.venv/
+venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+docs/venv
+
+# ide files
+*.swp
+*.swo
+.idea
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
