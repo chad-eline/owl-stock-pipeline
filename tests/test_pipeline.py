@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 import pipeline  # noqa: E402
 
 V1 = ROOT / "data" / "stock-data-se-owl.xlsx"
+V2 = ROOT / "data" / "stock-data-se-owl-part2.xlsx"
 SCHEMA = ROOT / "schema.sql"
 
 
@@ -29,7 +30,8 @@ def run(db_path, src):
     try:
         pipeline.ensure_schema(con, str(SCHEMA))
         df = pipeline.clean_file(pipeline.read_file(str(src)))
-        pipeline.load(con, df, str(src))
+        measures = pipeline.reconcile_prices(con, df)
+        pipeline.load(con, df, measures, str(src))
         con.commit()
     except Exception:
         con.rollback()
@@ -87,6 +89,25 @@ def test_clean_file_drops_hash_strips_and_dedupes():
     assert cleaned.height == 2
 
 
+def test_clean_file_parses_string_asof():
+    # csv inputs arrive with asof as text rather than a date dtype; it must
+    # still normalize to ISO YYYY-MM-DD strings.
+    raw = pl.DataFrame(
+        {
+            "#": [1],
+            "name": ["Apple"],
+            "asof": ["2023-11-03"],
+            "volume": [100],
+            "close_usd": [176.65],
+            "sector_level1": ["Technology"],
+            "sector_level2": ["Technology Equipment"],
+        }
+    )
+    cleaned = pipeline.clean_file(raw)
+    assert cleaned.schema["asof"] == pl.String
+    assert cleaned["asof"][0] == "2023-11-03"
+
+
 def test_read_file_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         pipeline.read_file(str(tmp_path / "nope.xlsx"))
@@ -97,6 +118,53 @@ def test_read_file_unsupported_extension(tmp_path):
     p.write_text("not a supported format")
     with pytest.raises(ValueError):
         pipeline.read_file(str(p))
+
+
+# --------------------------------------------------------------------------- #
+# reconcile_prices: contract validation + migration
+# --------------------------------------------------------------------------- #
+
+CORE = {"name", "asof", "volume", "close_usd", "sector_level1", "sector_level2"}
+
+
+def _schema_con(db_path):
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA foreign_keys = ON")
+    pipeline.ensure_schema(con, str(SCHEMA))
+    return con
+
+
+def test_reconcile_v1_shape_returns_baseline_measures(db):
+    con = _schema_con(db)
+    measures = pipeline.reconcile_prices(con, pl.DataFrame({c: [1] for c in CORE}))
+    con.close()
+    assert set(measures) == {"volume", "close_usd"}  # mktcap not present in v1
+
+
+def test_reconcile_adds_and_returns_mktcap(db):
+    con = _schema_con(db)
+    df = pl.DataFrame({c: [1] for c in CORE | {"mktcap_usd"}})
+    measures = pipeline.reconcile_prices(con, df)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(prices)")}
+    con.close()
+    assert "mktcap_usd" in measures  # drives the upsert
+    assert "mktcap_usd" in cols  # migration added the column
+
+
+def test_reconcile_raises_on_missing_required(db):
+    con = _schema_con(db)
+    with pytest.raises(ValueError, match="required"):
+        pipeline.reconcile_prices(con, pl.DataFrame({"name": [1], "asof": [1]}))
+    con.close()
+
+
+def test_reconcile_raises_on_unknown_column(db):
+    # mktcap is in the contract, but a genuinely new column still fails fast
+    con = _schema_con(db)
+    df = pl.DataFrame({c: [1] for c in CORE | {"dividend"}})
+    with pytest.raises(ValueError, match="Unrecognized"):
+        pipeline.reconcile_prices(con, df)
+    con.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -180,3 +248,39 @@ def test_schema_and_load_are_atomic(tmp_path):
     ]
     con.close()
     assert tables == []  # DDL + data rolled back as one unit
+
+
+# --------------------------------------------------------------------------- #
+# Commit 2: migration + backfill + in-place update
+# --------------------------------------------------------------------------- #
+
+
+def test_v2_migration_backfill_and_split(db):
+    run(db, V1)
+    run(db, V2)
+
+    # schema migrated and backfilled
+    cols = {r[1] for r in query(db, "PRAGMA table_info(prices)")}
+    assert "mktcap_usd" in cols
+    assert query(db, "SELECT count(*) FROM prices WHERE mktcap_usd IS NULL")[0][0] == 0
+
+    # Apple restated in place for the 2-for-1 split (close halved, volume doubled)
+    close, volume = query(
+        db,
+        "SELECT close_usd, volume FROM prices "
+        "WHERE asof = '2023-11-03' "
+        "AND company_id = (SELECT company_id FROM companies WHERE name = 'Apple')",
+    )[0]
+    assert close == pytest.approx(88.325)
+    assert volume == 159658500
+
+    # no duplicates from the re-run
+    assert count(db, "prices") == 17983
+
+    # two distinct runs recorded; v2 header shows the new column
+    runs = query(
+        db, "SELECT source_sha256, source_columns FROM load_runs ORDER BY run_id"
+    )
+    assert len(runs) == 2
+    assert runs[0][0] != runs[1][0]
+    assert "mktcap_usd" in runs[1][1]

@@ -47,3 +47,21 @@ print(con.execute("""
     ORDER BY cumulative_return DESC
     ;
     """).pl())
+
+
+# mktcap_usd only exists after the v2 migration; skip cleanly before then.
+if "mktcap_usd" in con.execute("SELECT * FROM owl.prices LIMIT 0").pl().columns:
+    print("Latest market cap per company:")
+    print(con.execute("""
+        SELECT c.name,
+                last(p.mktcap_usd ORDER BY p.asof) AS latest_mktcap_usd,
+                max(p.asof) AS latest_asof
+        FROM owl.prices p
+        JOIN owl.companies c
+        on p.company_id = c.company_id
+        GROUP BY c.name
+        ORDER BY latest_mktcap_usd DESC NULLS LAST
+        ;
+        """).pl())
+else:
+    print("Latest market cap per company: (mktcap_usd appears after the v2 load)")

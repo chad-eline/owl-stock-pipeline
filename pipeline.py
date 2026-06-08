@@ -4,6 +4,20 @@ import polars as pl
 import sqlite3
 import hashlib
 
+# prices fact contract: the single place column handling is declared.
+# REQUIRED_COLUMNS must be present on every source. PRICE_MEASURES are the fact
+# measures the pipeline knows, with their declared SQL types; adding a measure is a
+# one-line change here and it drives validation, migration, and the upsert together.
+REQUIRED_COLUMNS = {
+    "name",
+    "asof",
+    "volume",
+    "close_usd",
+    "sector_level1",
+    "sector_level2",
+}
+PRICE_MEASURES = {"volume": "INTEGER", "close_usd": "REAL", "mktcap_usd": "REAL"}
+
 
 def parse_args() -> argparse.Namespace:
     """
@@ -91,12 +105,17 @@ def clean_file(raw: pl.DataFrame) -> pl.DataFrame:
     result = raw.drop("#")
     result.columns = [str(c).strip() for c in result.columns]
 
-    # strip blanks on text values; normalize asof to ISO YYYY-MM-DD text
+    # strip blanks on text values; normalize asof to ISO YYYY-MM-DD text.
+    # asof comes in as a date from xlsx but as text from csv, so parse the
+    # text case first; both inputs then end up as ISO strings.
+    asof = pl.col("asof")
+    if result.schema["asof"] == pl.String:
+        asof = asof.str.to_date()
     result = result.with_columns(
         pl.col("name").str.strip_chars(),
         pl.col("sector_level1").str.strip_chars(),
         pl.col("sector_level2").str.strip_chars(),
-        pl.col("asof").dt.strftime("%Y-%m-%d"),
+        asof.dt.strftime("%Y-%m-%d"),
     )
 
     # defensive dedupe on name and asof
@@ -105,11 +124,41 @@ def clean_file(raw: pl.DataFrame) -> pl.DataFrame:
     return result
 
 
+def reconcile_prices(con, df) -> list:
+    """
+    Validates the source columns against the contract and migrates prices to match.
+    Fails if any REQUIRED_COLUMNS column is missing or on any column outside the contract,
+    i.e. no silent absorb of unknown data. Adds any known measure not yet in prices, using
+    its declared type (an idempotent ALTER, since SQLite has no ADD COLUMN IF NOT EXISTS).
+
+    Args:
+        con (sqlite3.Connection): SQLite connection (prices must already exist).
+        df (pl.DataFrame): Cleaned source data.
+
+    Returns:
+        list: the measure columns present in this source, in contract order; this
+        drives the prices upsert in load().
+    """
+    cols = set(df.columns)
+    if missing := REQUIRED_COLUMNS - cols:
+        raise ValueError(f"Source missing required columns: {sorted(missing)}")
+    if unknown := cols - REQUIRED_COLUMNS - set(PRICE_MEASURES):
+        raise ValueError(f"Unrecognized column(s) {sorted(unknown)} found on input.")
+
+    present = [c for c in PRICE_MEASURES if c in cols]
+    existing = {row[1] for row in con.execute("PRAGMA table_info(prices)")}
+    for c in present:
+        if c not in existing:
+            # declared type, not inferred; column name is a trusted contract key
+            con.execute(f"ALTER TABLE prices ADD COLUMN {c} {PRICE_MEASURES[c]}")
+    return present
+
+
 def ensure_schema(con, schema):
     """
-    Creates the schema in the SQLite database.
-    Reads the schema file, converts it to text, and executes it.
-    Ensures that the schema exists in the database.
+    Creates the schema in the SQLite database (idempotent CREATE TABLE statements).
+    Reads the schema file, converts it to text, and executes it. Migrations that
+    evolve an existing table (new measure columns) live in reconcile_prices.
 
     Args:
         con (sqlite3 Connection): Sqlite database connection.
@@ -129,13 +178,14 @@ def ensure_schema(con, schema):
     con.executescript(ddl)
 
 
-def load(con, df, file):
+def load(con, df, measures, file):
     """
     Upserts data from the source file into sectors/companies/prices + load_runs tables.
 
     Args:
         con (sqlite3.Connection): SQLite database connection.
         df (pl.DataFrame): Cleaned, validated source data.
+        measures (list): Price measure columns to write, from reconcile_prices.
         file (str): Path to the source file (hashed for the idempotency no-op).
 
     Returns:
@@ -173,19 +223,23 @@ def load(con, df, file):
         companies.iter_rows(),  # yields (name, level1, level2)
     )
 
-    # Upsert prices
-    prices = df.select("name", "asof", "volume", "close_usd").unique()
-    cur.executemany(
-        """
-        INSERT INTO prices(company_id, asof, volume, close_usd)
-        VALUES((select company_id from companies where name=?), ?, ?, ?)
-        ON CONFLICT(company_id, asof) DO UPDATE SET
-            volume=excluded.volume, 
-            close_usd=excluded.close_usd
-        ;
-        """,
-        prices.iter_rows(),
+    # Upsert prices. The column list is the measures reconcile_prices resolved for
+    # this source, so v1 and v2 share one path and the SQL is built from the contract
+    # (identifiers are trusted contract keys, never source data).
+    prices = df.select("name", "asof", *measures).unique(
+        subset=["name", "asof"], keep="last"
     )
+    cols = ", ".join(measures)
+    set_clause = ", ".join(f"{m}=excluded.{m}" for m in measures)
+    slots = ", ".join(
+        ["(SELECT company_id FROM companies WHERE name=?)", "?", *["?"] * len(measures)]
+    )
+    prices_sql = (
+        f"INSERT INTO prices(company_id, asof, {cols}) "
+        f"VALUES({slots}) "
+        f"ON CONFLICT(company_id, asof) DO UPDATE SET {set_clause}"
+    )
+    cur.executemany(prices_sql, prices.iter_rows())
 
     # record this run in load_runs (the load tracking table)
     cur.execute(
@@ -214,9 +268,14 @@ def main() -> None:
     # 3.12+: schema + load become one atomic transaction, for Py<3.12 do this in 2 transactions
     con.autocommit = False
     try:
-        ensure_schema(con, args.schema)  # deploy DDL (idempotent)
-        load(con, clean, args.file)  # upsert sectors/companies/prices + load_runs
-        con.commit()  # both ddl and data load in one db commit
+        ensure_schema(con, args.schema)  # create base tables (idempotent)
+        measures = reconcile_prices(
+            con, clean
+        )  # validate source + migrate prices to match
+        load(
+            con, clean, measures, args.file
+        )  # upsert sectors/companies/prices + load_runs
+        con.commit()  # schema, migration, and data in one db commit
     except Exception:
         con.rollback()  # roll back schema + data together on any failure
         raise
